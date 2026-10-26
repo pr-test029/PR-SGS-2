@@ -1,0 +1,111 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Fonction utilitaire pour vérifier si l'utilisateur est authentifié
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    // Fonction pour vérifier si l'utilisateur appartient à l'école spécifiée
+    // Gère à la fois les profils (dirigeants) et les sessions anonymes (élèves/staff)
+    function belongsToSchool(schoolId) {
+      return isAuthenticated() && (
+        (exists(/databases/$(database)/documents/profiles/$(request.auth.uid)) && get(/databases/$(database)/documents/profiles/$(request.auth.uid)).data.school_id == schoolId) ||
+        (exists(/databases/$(database)/documents/sessions/$(request.auth.uid)) && get(/databases/$(database)/documents/sessions/$(request.auth.uid)).data.school_id == schoolId)
+      );
+    }
+
+    // Fonction pour vérifier si l'utilisateur est l'administrateur système
+    function isAdmin() {
+      return isAuthenticated() &&
+             request.auth.token.email == 'powerfulreach029@gmail.com';
+    }
+
+    // Fonction pour vérifier si l'utilisateur est le propriétaire de l'école
+    function isSchoolOwner(schoolId) {
+      return isAuthenticated() && 
+             exists(/databases/$(database)/documents/schools/$(schoolId)) && 
+             get(/databases/$(database)/documents/schools/$(schoolId)).data.owner_id == request.auth.uid;
+    }
+
+    // --- COLLECTION PROFILES ---
+    match /profiles/{userId} {
+      allow read: if isAdmin() || (isAuthenticated() && request.auth.uid == userId);
+      allow create: if isAuthenticated() && request.auth.uid == userId;
+      allow update: if isAdmin() || (isAuthenticated() && request.auth.uid == userId);
+    }
+
+    // --- COLLECTION SESSIONS (Anonymes) ---
+    match /sessions/{userId} {
+      allow read, write: if isAuthenticated() && request.auth.uid == userId;
+    }
+
+    // --- COLLECTION SCHOOLS ---
+    match /schools/{schoolId} {
+      // Autoriser la lecture pour l'admin ou tout utilisateur authentifié
+      // Nécessaire pour vérifier l'abonnement au moment du login avant la création de session
+      allow read: if isAdmin() || isAuthenticated();
+      
+      allow create: if isAuthenticated();
+      
+      // Seul l'admin ou le propriétaire peut modifier l'école.
+      // Le propriétaire PEUT modifier son abonnement (nécessaire pour le paiement via MoneyFusion).
+      // NOTE : À sécuriser via Cloud Functions ultérieurement.
+      // Delete allowed for admin or school owner
+      allow delete: if isAdmin() || isSchoolOwner(schoolId);
+    }
+
+    // --- COLLECTION STUDENTS ---
+    match /students/{studentId} {
+      // Autoriser la lecture (get/list) pour tout utilisateur authentifié (nécessaire pour le lookup matricule)
+      allow read: if isAdmin() || isAuthenticated();
+      
+      allow create: if isAdmin() || isSchoolOwner(request.resource.data.school_id) || belongsToSchool(request.resource.data.school_id);
+      allow update: if isAdmin() || isSchoolOwner(request.resource.data.school_id) || belongsToSchool(request.resource.data.school_id);
+      allow delete: if isAdmin() || isSchoolOwner(resource.data.school_id) || belongsToSchool(resource.data.school_id);
+    }
+
+    // --- COLLECTION GRADES ---
+    match /grades/{gradeId} {
+      allow read: if isAdmin() || belongsToSchool(resource.data.school_id);
+      allow create: if isAdmin() || isSchoolOwner(request.resource.data.school_id) || belongsToSchool(request.resource.data.school_id);
+      allow update: if isAdmin() || isSchoolOwner(request.resource.data.school_id) || belongsToSchool(request.resource.data.school_id);
+      allow delete: if isAdmin() || isSchoolOwner(resource.data.school_id) || belongsToSchool(resource.data.school_id);
+    }
+
+    // --- COLLECTION APP_CONFIG ---
+    match /app_config/{configId} {
+      // Autoriser la lecture pour tout utilisateur authentifié (nécessaire pour le personnel dont les données sont dans settings)
+      allow read: if isAdmin() || isAuthenticated();
+
+      allow create: if isAdmin() || belongsToSchool(request.resource.data.school_id);
+      allow update: if isAdmin() || belongsToSchool(request.resource.data.school_id);
+      allow delete: if isAdmin() || belongsToSchool(resource.data.school_id);
+    }
+
+    // --- COLLECTION PAYMENTS ---
+    match /payments/{paymentId} {
+      allow read: if isAdmin() || belongsToSchool(resource.data.school_id);
+      allow create: if isAdmin() || belongsToSchool(request.resource.data.school_id);
+      allow update: if isAdmin() || isSchoolOwner(request.resource.data.school_id) || belongsToSchool(request.resource.data.school_id);
+      allow delete: if isAdmin() || belongsToSchool(resource.data.school_id);
+    }
+
+    // --- COLLECTION EXPENSES ---
+    match /expenses/{expenseId} {
+      allow read: if isAdmin() || belongsToSchool(resource.data.school_id);
+      allow create: if isAdmin() || belongsToSchool(request.resource.data.school_id);
+      allow update: if isAdmin() || isSchoolOwner(request.resource.data.school_id) || belongsToSchool(request.resource.data.school_id);
+      allow delete: if isAdmin() || belongsToSchool(resource.data.school_id);
+    }
+
+    // --- COLLECTION ADMIN LOGS (pour traçabilité) ---
+    match /admin_logs/{logId} {
+      // Lecture: admin uniquement
+      allow read: if isAdmin();
+      // Écriture: admin uniquement
+      allow create: if isAdmin();
+    }
+  }
+}

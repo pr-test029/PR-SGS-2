@@ -1,0 +1,955 @@
+import React, { useState, useMemo, useRef } from 'react';
+import { Card, Input, Button, Select, Modal } from '../../components/ui/Common';
+import { HelpGuide } from '../../components/ui/HelpGuide';
+import { useSchool } from '../../App';
+import { Student, Payment, Expense } from '../../types';
+import { ReceiptGenerator, ReceiptData, ReceiptGeneratorRef } from './ReceiptGenerator';
+import { DetailedAccounting } from './DetailedAccounting';
+
+export const Accounting: React.FC = () => {
+    const { students, payments, expenses, cycles, settings, addPayment, addExpense, deleteExpense, session, selectedAcademicYear, updateStudent } = useSchool();
+    
+    // Tabs
+    const [activeTab, setActiveTab] = useState<'encaissements' | 'historique_encaissements' | 'decaissements' | 'analyses'>('encaissements');
+
+    // -- ENCAISSEMENTS STATE --
+    const [searchQuery, setSearchQuery] = useState('');
+    const [selectedCycle, setSelectedCycle] = useState<string>('');
+    const [selectedClass, setSelectedClass] = useState<string>('');
+    const [selectedStudent, setSelectedStudent] = useState<Student | null>(null);
+    const [isPaymentModalOpen, setIsPaymentModalOpen] = useState(false);
+    const [paymentAmount, setPaymentAmount] = useState<number>(0);
+    const [paymentMethod, setPaymentMethod] = useState<Payment['method']>('cash');
+    const [paymentNotes, setPaymentNotes] = useState('');
+    // -- ENCAISSEMENT DIVERS STATE --
+    const [isOtherPaymentModalOpen, setIsOtherPaymentModalOpen] = useState(false);
+    const [otherPaymentAmount, setOtherPaymentAmount] = useState<number>(0);
+    const [otherPaymentMethod, setOtherPaymentMethod] = useState<Payment['method']>('cash');
+    const [otherPaymentNotes, setOtherPaymentNotes] = useState('');
+
+    // -- DÉCAISSEMENTS STATE --
+    const [expenseLabel, setExpenseLabel] = useState('');
+    const [expenseAmount, setExpenseAmount] = useState<number>(0);
+
+    // Receipt Generator Ref
+    const receiptGenRef = useRef<ReceiptGeneratorRef>(null);
+
+    // Filtering logic
+    const filteredStudents = useMemo(() => {
+        return students.filter(s => {
+            const matchesSearch = s.nom.toLowerCase().includes(searchQuery.toLowerCase()) || 
+                                 s.prenom.toLowerCase().includes(searchQuery.toLowerCase()) ||
+                                 s.matricule.toLowerCase().includes(searchQuery.toLowerCase());
+            const matchesCycle = selectedCycle ? s.cycle === selectedCycle : true;
+            const fullClassName = s.serie ? `${s.classe} ${s.serie}` : s.classe;
+            const matchesClass = selectedClass ? fullClassName === selectedClass : true;
+            return matchesSearch && matchesCycle && matchesClass;
+        });
+    }, [students, searchQuery, selectedCycle, selectedClass]);
+
+    const getStudentMonthlyFee = (student: Student) => {
+        const fullClassName = student.serie ? `${student.classe} ${student.serie}` : student.classe;
+        if (student.isSpecial) {
+            if (student.specialMonthlyFee !== undefined && student.specialMonthlyFee >= 0) {
+                return student.specialMonthlyFee;
+            }
+            const classSpecialFee = settings.accounting?.classSpecialFees?.[fullClassName] ?? settings.accounting?.classSpecialFees?.[student.classe];
+            if (classSpecialFee !== undefined && classSpecialFee >= 0) {
+                return classSpecialFee;
+            }
+        }
+        return settings.accounting?.classFees?.[fullClassName] ?? settings.accounting?.classFees?.[student.classe] ?? 0;
+    };
+
+    const getStudentAnnualFee = (student: Student) => {
+        return getStudentMonthlyFee(student) * 9;
+    };
+
+    const getStudentTotalPaid = (studentId: string, baseTotalPaid: number = 0) => {
+        // Ne comptabiliser que les paiements de scolarité (exclure frais d'inscription et réinscription)
+        const sumPayments = payments
+            .filter(p => {
+                if (p.studentId !== studentId) return false;
+                if (p.type === 'registration' || p.type === 're_registration') return false;
+                if (p.notes && /inscription/i.test(p.notes)) return false;
+                return true;
+            })
+            .reduce((acc, p) => acc + (p.amount || 0), 0);
+        return sumPayments;
+    };
+
+    // Financial Stats
+    const stats = useMemo(() => {
+        let totalExpected = 0;
+        let totalCollected = 0;
+        let totalExpenses = 0;
+        let totalInscriptions = 0;
+        let totalReInscriptions = 0;
+
+        const regFee = settings.accounting?.registrationFee || 0;
+
+        students.forEach(s => {
+            const annualFee = getStudentAnnualFee(s);
+            totalExpected += annualFee + regFee;
+            const paid = getStudentTotalPaid(s.id, s.totalPaid || 0);
+            totalCollected += paid;
+        });
+
+        // Add diverse encashments (studentId === 'divers')
+        payments.filter(p => p.studentId === 'divers').forEach(p => {
+            totalCollected += p.amount;
+        });
+
+        payments.forEach(p => {
+            const note = (p.notes || '').toLowerCase();
+            const isReEnroll = note.includes("réinscription") || note.includes("reinscription");
+            const isEnroll = !isReEnroll && (note.includes("frais d'inscription") || note.includes("inscription"));
+
+            if (isReEnroll) {
+                totalReInscriptions += (p.amount || 0);
+            } else if (isEnroll) {
+                totalInscriptions += (p.amount || 0);
+            }
+        });
+
+        expenses.forEach(e => {
+            totalExpenses += (e.amount || 0);
+        });
+
+        const totalRemaining = Math.max(0, totalExpected - totalCollected);
+        const collectionRate = totalExpected > 0 ? Math.min(100, Math.round((totalCollected / totalExpected) * 100)) : 0;
+        const remainingRate = 100 - collectionRate;
+        const balance = totalCollected - totalExpenses;
+        
+        return {
+            totalExpected,
+            totalCollected,
+            totalRemaining,
+            collectionRate,
+            remainingRate,
+            totalExpenses,
+            balance,
+            totalInscriptions,
+            totalReInscriptions
+        };
+    }, [students, payments, expenses, settings.accounting]);
+
+    // Live Student & Stats for Modal
+    const currentStudent = useMemo(() => {
+        if (!selectedStudent) return null;
+        return students.find(s => s.id === selectedStudent.id) || selectedStudent;
+    }, [students, selectedStudent]);
+
+    const currentStudentStats = useMemo(() => {
+        if (!currentStudent) return { annualFee: 0, monthlyFee: 0, paidAmount: 0, remainingAmount: 0, progressPercent: 0 };
+        const annualFee = getStudentAnnualFee(currentStudent);
+        const monthlyFee = annualFee / 9;
+        const paidAmount = getStudentTotalPaid(currentStudent.id, currentStudent.totalPaid || 0);
+        const remainingAmount = Math.max(0, annualFee - paidAmount);
+        const progressPercent = annualFee > 0 ? Math.min(100, Math.round((paidAmount / annualFee) * 100)) : 0;
+
+        return {
+            annualFee,
+            monthlyFee,
+            paidAmount,
+            remainingAmount,
+            progressPercent
+        };
+    }, [currentStudent, payments, settings.accounting]);
+
+    const handleRecordPayment = () => {
+        if (!currentStudent || paymentAmount <= 0) return;
+        
+        const remaining = currentStudentStats.remainingAmount;
+
+        if (currentStudentStats.annualFee > 0 && paymentAmount > remaining) {
+            alert(`Le montant dépasse le solde annuel restant (${remaining.toLocaleString()} FCFA).`);
+            return;
+        }
+
+        const p: Payment = {
+            id: Date.now().toString(),
+            studentId: currentStudent.id,
+            academic_year: selectedAcademicYear,
+            amount: paymentAmount,
+            date: new Date().toISOString(),
+            method: paymentMethod,
+            notes: paymentNotes,
+            recorded_by: session?.user_id,
+            recorded_by_name: session?.display_name || 'Inconnu'
+        };
+
+        addPayment(p);
+        setPaymentAmount(0);
+        setPaymentNotes('');
+        alert("Paiement enregistré avec succès !");
+    };
+
+    const handleGenerateReceipt = (type: 'ENCAISSEMENT' | 'DÉCAISSEMENT', item: Payment | Expense, student?: Student) => {
+        if (!receiptGenRef.current) return;
+        
+        let label = (item as Expense).label || '';
+        if (type === 'ENCAISSEMENT') {
+            label = student ? `Scolarité : ${student.nom} ${student.prenom} - ${(item as Payment).notes || 'Versement'}` : 'Paiement scolarité';
+        }
+
+        const receiptData: ReceiptData = {
+            type,
+            id: item.id,
+            date: item.date,
+            amount: item.amount,
+            label,
+            recordedBy: item.recorded_by_name || 'Inconnu',
+            schoolName: settings.appName
+        };
+        receiptGenRef.current.generateReceipt(receiptData);
+    };
+
+    const handleRecordExpense = () => {
+        // Validate input
+        if (!expenseLabel || expenseAmount <= 0) {
+            alert("Veuillez remplir le libellé et le montant.");
+            return;
+        }
+        // Create expense object
+        const e: Expense = {
+            id: Date.now().toString(),
+            academic_year: selectedAcademicYear,
+            label: expenseLabel,
+            amount: expenseAmount,
+            date: new Date().toISOString(),
+            recorded_by: session?.user_id,
+            recorded_by_name: session?.display_name || 'Inconnu'
+        };
+        // Add expense and reset fields
+        addExpense(e);
+        setExpenseLabel('');
+        setExpenseAmount(0);
+        alert("Dépense enregistrée avec succès !");
+    };;
+
+    // Handler for other encaissement (diverse payments)
+    const handleRecordOtherEncashment = () => {
+        if (otherPaymentAmount <= 0) {
+            alert('Le montant doit être positif.');
+            return;
+        }
+        // Record as a payment without a specific student (generic)
+        const p: Payment = {
+            id: Date.now().toString(),
+            studentId: 'divers', // identifier for diverse payments
+            academic_year: selectedAcademicYear,
+            amount: otherPaymentAmount,
+            date: new Date().toISOString(),
+            method: otherPaymentMethod,
+            notes: otherPaymentNotes,
+            recorded_by: session?.user_id,
+            recorded_by_name: session?.display_name || 'Inconnu'
+        };
+        addPayment(p);
+        setIsOtherPaymentModalOpen(false);
+        setOtherPaymentAmount(0);
+        setOtherPaymentNotes('');
+        alert('Encaissement divers enregistré avec succès!');
+    };
+
+    return (
+        <div className="space-y-6 animate-fade-in">
+            {/* Global Stats Dashboard */}
+            <div className="grid grid-cols-1 lg:grid-cols-4 gap-6">
+                <Card className="lg:col-span-4">
+                    <div className="flex flex-col md:flex-row items-center gap-8 p-4">
+                        <div className="relative w-44 h-44 flex-shrink-0 flex items-center justify-center">
+                            {/* SVG Doughnut Chart */}
+                            <svg viewBox="0 0 36 36" className="w-full h-full transform -rotate-90">
+                                {/* Track circle for Reste à Recouvrer (Purple/Rose) */}
+                                <circle 
+                                    cx="18" cy="18" r="15.915" 
+                                    fill="transparent" 
+                                    stroke="#f43f5e" 
+                                    strokeWidth="3.5" 
+                                    className="dark:stroke-rose-900/50 opacity-40"
+                                />
+                                {/* Progress circle for Encaissé (Emerald Green / Primary) */}
+                                <circle 
+                                    cx="18" cy="18" r="15.915" fill="transparent" 
+                                    stroke="var(--primary-color, #10b981)" strokeWidth="3.5" 
+                                    strokeDasharray={`${stats.collectionRate} ${100 - stats.collectionRate}`}
+                                    strokeDashoffset="0"
+                                    strokeLinecap="round"
+                                    className="transition-all duration-1000 ease-out"
+                                />
+                            </svg>
+                            <div className="absolute inset-0 flex flex-col items-center justify-center pointer-events-none">
+                                <span className="text-2xl font-black text-gray-800 dark:text-white">
+                                    {stats.collectionRate}%
+                                </span>
+                                <span className="text-[9px] uppercase font-bold text-emerald-600 dark:text-emerald-400 tracking-wider">Recouvré</span>
+                                <span className="text-[8px] font-semibold text-rose-500 dark:text-rose-400 mt-0.5">
+                                    {stats.remainingRate}% à recouvrer
+                                </span>
+                            </div>
+                        </div>
+                        <div className="flex-1 space-y-4 w-full">
+                            <h3 className="text-xl font-bold dark:text-white">Santé Financière Globale</h3>
+                            <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+                                <div className="p-3 bg-green-50 dark:bg-green-900/20 rounded-xl border border-green-100 dark:border-green-800/30">
+                                    <p className="text-xs text-green-600 dark:text-green-400 font-bold uppercase">Encaissé</p>
+                                    <p className="text-lg font-bold dark:text-white">{stats.totalCollected.toLocaleString()} <span className="text-[10px]">FCFA</span></p>
+                                </div>
+                                <div className="p-3 bg-red-50 dark:bg-red-900/20 rounded-xl border border-red-100 dark:border-red-800/30">
+                                    <p className="text-xs text-red-600 dark:text-red-400 font-bold uppercase">Décaissements</p>
+                                    <p className="text-lg font-bold dark:text-white">{stats.totalExpenses.toLocaleString()} <span className="text-[10px]">FCFA</span></p>
+                                </div>
+                                <div className="p-3 bg-blue-50 dark:bg-blue-900/20 rounded-xl border border-blue-100 dark:border-blue-800/30">
+                                    <p className="text-xs text-blue-600 dark:text-blue-400 font-bold uppercase">Solde Caisse</p>
+                                    <p className="text-lg font-bold dark:text-white">{stats.balance.toLocaleString()} <span className="text-[10px]">FCFA</span></p>
+                                </div>
+                                <div className="p-3 bg-purple-50 dark:bg-purple-900/20 rounded-xl border border-purple-100 dark:border-purple-800/30">
+                                    <p className="text-xs text-purple-600 dark:text-purple-400 font-bold uppercase">Reste à Recouvrer</p>
+                                    <p className="text-lg font-bold dark:text-white">{stats.totalRemaining.toLocaleString()} <span className="text-[10px]">FCFA</span></p>
+                                </div>
+                            </div>
+                            <div className="grid grid-cols-2 gap-4 mt-4">
+                                <div className="p-3 bg-teal-50 dark:bg-teal-900/20 rounded-xl border border-teal-100 dark:border-teal-800/30">
+                                    <p className="text-xs text-teal-600 dark:text-teal-400 font-bold uppercase">Inscriptions</p>
+                                    <p className="text-lg font-bold dark:text-white">{stats.totalInscriptions.toLocaleString()} <span className="text-[10px]">FCFA</span></p>
+                                </div>
+                                <div className="p-3 bg-orange-50 dark:bg-orange-900/20 rounded-xl border border-orange-100 dark:border-orange-800/30">
+                                    <p className="text-xs text-orange-600 dark:text-orange-400 font-bold uppercase">Réinscriptions</p>
+                                    <p className="text-lg font-bold dark:text-white">{stats.totalReInscriptions.toLocaleString()} <span className="text-[10px]">FCFA</span></p>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </Card>
+            </div>
+
+            {/* Tabs */}
+            <div className="flex flex-wrap gap-4 border-b border-gray-200 dark:border-white/10 pb-4 items-center">
+              <button
+                className={`px-6 py-2 rounded-xl font-bold transition-all ${activeTab === 'encaissements' ? 'bg-[var(--primary-color)] text-white shadow-lg' : 'bg-white dark:bg-white/5 text-gray-600 dark:text-gray-300'}`}
+                onClick={() => setActiveTab('encaissements')}
+              >
+                <i className="fas fa-hand-holding-usd mr-2"></i> Scolarité (Élèves)
+              </button>
+              <button
+                className={`px-6 py-2 rounded-xl font-bold transition-all ${activeTab === 'historique_encaissements' ? 'bg-[var(--primary-color)] text-white shadow-lg' : 'bg-white dark:bg-white/5 text-gray-600 dark:text-gray-300'}`}
+                onClick={() => setActiveTab('historique_encaissements')}
+              >
+                <i className="fas fa-list mr-2"></i> Historique (Autres)
+              </button>
+              <button
+                className={`px-6 py-2 rounded-xl font-bold transition-all ${activeTab === 'decaissements' ? 'bg-red-600 text-white shadow-lg shadow-red-500/30' : 'bg-white dark:bg-white/5 text-gray-600 dark:text-gray-300'}`}
+                onClick={() => setActiveTab('decaissements')}
+              >
+                <i className="fas fa-file-invoice-dollar mr-2"></i> Décaissements (Dépenses)
+              </button>
+              <button
+                className={`px-6 py-2 rounded-xl font-bold transition-all ${activeTab === 'analyses' ? 'bg-indigo-600 text-white shadow-lg shadow-indigo-500/30' : 'bg-white dark:bg-white/5 text-gray-600 dark:text-gray-300'}`}
+                onClick={() => setActiveTab('analyses')}
+              >
+                <i className="fas fa-chart-pie mr-2"></i> Analyses & Statistiques
+              </button>
+              <button 
+                className="ml-auto px-4 py-2 bg-gradient-to-r from-emerald-500 to-teal-500 hover:from-emerald-600 hover:to-teal-600 text-white rounded-xl font-bold shadow-lg shadow-teal-500/30 transition-all flex items-center gap-2" 
+                onClick={() => setIsOtherPaymentModalOpen(true)}
+              >
+                <i className="fas fa-plus-circle"></i> Autre Encaissement
+              </button>
+            </div>
+
+            {/* Hidden Receipt Generator component */}
+            <ReceiptGenerator ref={receiptGenRef} />
+
+            {/* TAB CONTENT: ENCAISSEMENTS */}
+            {activeTab === 'encaissements' && (
+                <div className="space-y-6 animate-fade-in">
+                    <Card title="Accès Rapide" className="flex flex-col justify-center">
+                        <div className="space-y-4">
+                            <Input 
+                                placeholder="Rechercher par Nom ou Matricule..." 
+                                icon={<i className="fas fa-search"></i>}
+                                value={searchQuery}
+                                onChange={e => setSearchQuery(e.target.value)}
+                            />
+                            <div className="grid grid-cols-2 gap-2">
+                                <Select 
+                                    value={selectedCycle}
+                                    onChange={e => setSelectedCycle(e.target.value)}
+                                    options={[
+                                        { value: '', label: 'Tous Cycles' },
+                                        ...Object.values(cycles).map(c => ({ value: c.id, label: c.name }))
+                                    ]}
+                                />
+                                <Select 
+                                    value={selectedClass}
+                                    onChange={e => setSelectedClass(e.target.value)}
+                                    options={[
+                                        { value: '', label: 'Toutes Classes' },
+                                        ...(selectedCycle ? Array.from(new Set(students.filter(s => s.cycle === selectedCycle).map(s => s.serie ? `${s.classe} ${s.serie}` : s.classe))).map(cls => ({ value: cls, label: cls })) : [])
+                                    ]}
+                                    disabled={!selectedCycle}
+                                />
+                            </div>
+                        </div>
+                    </Card>
+
+                    <Card title={`Liste des Élèves (${filteredStudents.length})`}>
+                        <div className="overflow-x-auto">
+                            <table className="min-w-full divide-y divide-gray-200 dark:divide-white/10">
+                                <thead className="bg-gray-50 dark:bg-white/5">
+                                    <tr>
+                                        <th className="px-4 py-3 text-left text-xs font-bold text-gray-500 dark:text-gray-400 uppercase">Matricule</th>
+                                        <th className="px-4 py-3 text-left text-xs font-bold text-gray-500 dark:text-gray-400 uppercase">Nom & Prénom</th>
+                                        <th className="px-4 py-3 text-left text-xs font-bold text-gray-500 dark:text-gray-400 uppercase">Classe</th>
+                                        <th className="px-4 py-3 text-left text-xs font-bold text-gray-500 dark:text-gray-400 uppercase">Progression</th>
+                                        <th className="px-4 py-3 text-left text-xs font-bold text-gray-500 dark:text-gray-400 uppercase">Solde</th>
+                                        <th className="px-4 py-3 text-right">Actions</th>
+                                    </tr>
+                                </thead>
+                                <tbody className="bg-white dark:bg-transparent divide-y divide-gray-200 dark:divide-white/10">
+                                    {filteredStudents.map(s => {
+                                        const annual = getStudentAnnualFee(s);
+                                        const paid = getStudentTotalPaid(s.id, s.totalPaid || 0);
+                                        const remaining = Math.max(0, annual - paid);
+                                        const progress = annual > 0 ? Math.min(100, Math.round((paid / annual) * 100)) : 0;
+
+                                        return (
+                                            <tr key={s.id} className="hover:bg-gray-50 dark:hover:bg-white/5 transition-colors group">
+                                                <td className="px-4 py-4 whitespace-nowrap text-sm font-mono font-bold text-[var(--primary-color)] dark:text-blue-300">
+                                                    {s.matricule}
+                                                </td>
+                                                <td className="px-4 py-4 whitespace-nowrap">
+                                                    <div className="flex items-center gap-3">
+                                                        {s.photo ? <img src={s.photo} className="w-8 h-8 rounded-full object-cover" /> : <div className="w-8 h-8 rounded-full bg-gray-200 dark:bg-gray-700 flex items-center justify-center text-xs font-bold">{s.nom[0]}</div>}
+                                                        <span className="text-sm font-medium dark:text-white">{s.nom} {s.prenom}</span>
+                                                    </div>
+                                                </td>
+                                                <td className="px-4 py-4 whitespace-nowrap text-sm text-gray-600 dark:text-gray-300">
+                                                    {s.classe}
+                                                </td>
+                                                <td className="px-4 py-4 whitespace-nowrap">
+                                                    <div className="w-32">
+                                                        <div className="flex justify-between text-[10px] mb-1 dark:text-gray-400">
+                                                            <span>{progress}%</span>
+                                                            <span>{paid.toLocaleString()} FCFA</span>
+                                                        </div>
+                                                        <div className="w-full bg-gray-200 dark:bg-gray-700 rounded-full h-1.5 overflow-hidden">
+                                                            <div 
+                                                                className={`h-full transition-all duration-500 ${progress === 100 ? 'bg-green-500' : 'bg-[var(--primary-color)]'}`} 
+                                                                style={{ width: `${progress}%` }}
+                                                            ></div>
+                                                        </div>
+                                                    </div>
+                                                </td>
+                                                <td className={`px-4 py-4 whitespace-nowrap text-sm font-bold ${annual === 0 ? 'text-orange-500' : remaining === 0 ? 'text-green-600 dark:text-green-400' : 'text-red-600 dark:text-red-400'}`}>
+                                                    {annual === 0 ? 'Non Configuré' : remaining === 0 ? 'SOLDÉ' : `${remaining.toLocaleString()} FCFA`}
+                                                </td>
+                                                <td className="px-4 py-4 whitespace-nowrap text-right space-x-2">
+                                                    <button
+                                                        type="button"
+                                                        onClick={() => {
+                                                            const willBeSpecial = !s.isSpecial;
+                                                            const updatedStudent = { ...s, isSpecial: willBeSpecial };
+                                                            updateStudent(updatedStudent);
+                                                        }}
+                                                        className={`px-2.5 py-1.5 rounded-lg text-xs font-bold transition-all border ${
+                                                            s.isSpecial 
+                                                                ? 'bg-amber-100 text-amber-800 border-amber-300 dark:bg-amber-900/40 dark:text-amber-300 dark:border-amber-700 hover:bg-amber-200' 
+                                                                : 'bg-gray-100 text-gray-600 border-gray-200 dark:bg-white/5 dark:text-gray-300 dark:border-white/10 hover:bg-gray-200'
+                                                        }`}
+                                                        title={s.isSpecial ? "Statut Spécial activé (cliquez pour retirer)" : "Accorder le statut spécial"}
+                                                    >
+                                                        <i className={`fas fa-star mr-1 ${s.isSpecial ? 'text-amber-500' : 'text-gray-400'}`}></i>
+                                                        {s.isSpecial ? 'Spécial' : 'Standard'}
+                                                    </button>
+                                                    <Button 
+                                                        size="sm" 
+                                                        variant={remaining === 0 && annual > 0 ? "secondary" : "primary"}
+                                                        onClick={() => { setSelectedStudent(s); setIsPaymentModalOpen(true); }}
+                                                    >
+                                                        <i className="fas fa-receipt mr-2"></i> Gérer
+                                                    </Button>
+                                                </td>
+                                            </tr>
+                                        );
+                                    })}
+                                    {filteredStudents.length === 0 && (
+                                        <tr>
+                                            <td colSpan={6} className="px-4 py-12 text-center text-gray-500 italic">
+                                                Aucun élève trouvé avec ces critères.
+                                            </td>
+                                        </tr>
+                                    )}
+                                </tbody>
+                            </table>
+                        </div>
+                    </Card>
+                </div>
+            )}
+
+            {/* TAB CONTENT: HISTORIQUE ENCAISSEMENTS DIVERS */}
+            {activeTab === 'historique_encaissements' && (
+                <div className="space-y-6 animate-fade-in">
+                    <Card title="Historique des Autres Encaissements">
+                        <div className="space-y-3 max-h-[600px] overflow-y-auto pr-2 custom-scrollbar">
+                            {payments.filter(p => p.studentId === 'divers').sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime()).map(p => {
+                                const studentName = 'Encaissement Divers';
+                                return (
+                                <div key={p.id} className="flex justify-between items-center p-4 bg-white dark:bg-white/5 border dark:border-white/10 rounded-xl transition-all hover:border-[var(--primary-color)]">
+                                    <div>
+                                        <p className="font-bold text-gray-800 dark:text-white text-lg">{studentName}</p>
+                                        <p className="text-sm font-medium text-[var(--primary-color)]">{p.notes || 'Scolarité'}</p>
+                                        <div className="flex gap-3 text-xs text-gray-500 mt-1">
+                                            <span><i className="far fa-clock mr-1"></i> {new Date(p.date).toLocaleDateString('fr-FR')} à {new Date(p.date).toLocaleTimeString('fr-FR')}</span>
+                                            <span><i className="far fa-user mr-1"></i> {p.recorded_by_name}</span>
+                                            <span className="capitalize"><i className="fas fa-money-bill mr-1"></i> {p.method.replace('_', ' ')}</span>
+                                        </div>
+                                    </div>
+                                    <div className="flex items-center gap-4">
+                                        <span className="font-black text-green-600 dark:text-green-400 text-xl">
+                                            + {p.amount.toLocaleString()} FCFA
+                                        </span>
+                                        <button 
+                                            onClick={() => handleGenerateReceipt('ENCAISSEMENT', p)}
+                                            className="w-10 h-10 flex items-center justify-center bg-gray-100 hover:bg-gray-200 dark:bg-gray-800 dark:hover:bg-gray-700 text-gray-600 dark:text-gray-300 rounded-lg transition-colors"
+                                            title="Générer un reçu PDF"
+                                        >
+                                            <i className="fas fa-file-pdf"></i>
+                                        </button>
+                                    </div>
+                                </div>
+                                );
+                            })}
+                            {payments.filter(p => p.studentId === 'divers').length === 0 && (
+                                <div className="text-center py-10 text-gray-400 italic">
+                                    <i className="fas fa-receipt text-4xl mb-3 opacity-20 block"></i>
+                                    Aucun encaissement enregistré.
+                                </div>
+                            )}
+                        </div>
+                    </Card>
+                </div>
+            )}
+
+            {/* TAB CONTENT: DÉCAISSEMENTS */}
+            {activeTab === 'decaissements' && (
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-6 animate-fade-in">
+                    <Card title="Enregistrer une dépense" className="md:col-span-1 h-fit">
+                        <div className="space-y-4">
+                            <Input 
+                                label="Libellé / Achat matériel" 
+                                value={expenseLabel} 
+                                onChange={e => setExpenseLabel(e.target.value)}
+                                placeholder="Ex: Achat de craies, Facture d'eau..."
+                            />
+                            <Input 
+                                label="Montant décaissé (FCFA)" 
+                                type="number" 
+                                value={expenseAmount || ''} 
+                                onChange={e => setExpenseAmount(parseInt(e.target.value) || 0)}
+                                placeholder="Ex: 15000"
+                                className="text-lg font-bold text-red-600"
+                            />
+                            <Button 
+                                variant="primary" 
+                                className="w-full !bg-red-600 hover:!bg-red-700 mt-2 shadow-lg shadow-red-500/20"
+                                onClick={handleRecordExpense}
+                            >
+                                <i className="fas fa-minus-circle mr-2"></i> Valider la dépense
+                            </Button>
+                        </div>
+                    </Card>
+
+                    <Card title="Historique des Décaissements" className="md:col-span-2">
+                        <div className="space-y-3 max-h-[600px] overflow-y-auto pr-2 custom-scrollbar">
+                            {expenses.sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime()).map(e => (
+                                <div key={e.id} className="flex justify-between items-center p-4 bg-white dark:bg-white/5 border dark:border-white/10 rounded-xl transition-all hover:border-red-200 dark:hover:border-red-900/50">
+                                    <div>
+                                        <p className="font-bold text-gray-800 dark:text-white text-lg">{e.label}</p>
+                                        <div className="flex gap-3 text-xs text-gray-500 mt-1">
+                                            <span><i className="far fa-clock mr-1"></i> {new Date(e.date).toLocaleDateString('fr-FR')} à {new Date(e.date).toLocaleTimeString('fr-FR')}</span>
+                                            <span><i className="far fa-user mr-1"></i> {e.recorded_by_name}</span>
+                                        </div>
+                                    </div>
+                                    <div className="flex items-center gap-4">
+                                        <span className="font-black text-red-600 dark:text-red-400 text-xl">
+                                            - {e.amount.toLocaleString()} FCFA
+                                        </span>
+                                        <button 
+                                            onClick={() => handleGenerateReceipt('DÉCAISSEMENT', e)}
+                                            className="w-10 h-10 flex items-center justify-center bg-gray-100 hover:bg-gray-200 dark:bg-gray-800 dark:hover:bg-gray-700 text-gray-600 dark:text-gray-300 rounded-lg transition-colors"
+                                            title="Générer un reçu PDF"
+                                        >
+                                            <i className="fas fa-file-pdf"></i>
+                                        </button>
+                                        <button 
+                                            onClick={() => {
+                                                if(confirm('Supprimer cette dépense ?')) {
+                                                    deleteExpense(e.id);
+                                                }
+                                            }}
+                                            className="w-10 h-10 flex items-center justify-center bg-red-50 hover:bg-red-100 text-red-500 rounded-lg transition-colors"
+                                            title="Supprimer"
+                                        >
+                                            <i className="fas fa-trash"></i>
+                                        </button>
+                                    </div>
+                                </div>
+                            ))}
+                            {expenses.length === 0 && (
+                                <div className="text-center py-10 text-gray-400 italic">
+                                    <i className="fas fa-file-invoice-dollar text-4xl mb-3 opacity-20 block"></i>
+                                    Aucune dépense enregistrée.
+                                </div>
+                            )}
+                        </div>
+                    </Card>
+                </div>
+            )}
+
+            {/* TAB CONTENT: ANALYSES & STATISTIQUES AVANCÉES (4ème ONGLET) */}
+            {activeTab === 'analyses' && (
+                <DetailedAccounting 
+                    students={students}
+                    payments={payments}
+                    expenses={expenses}
+                    cycles={cycles}
+                    accountingSettings={settings.accounting}
+                />
+            )}
+
+            {/* Payment Modal (Encaissements only) */}
+            {isPaymentModalOpen && currentStudent && (
+                <Modal 
+                    isOpen={true} 
+                    onClose={() => setIsPaymentModalOpen(false)} 
+                    title={`Compte de : ${currentStudent.nom} ${currentStudent.prenom}`}
+                    maxWidth="max-w-4xl"
+                >
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
+                        {/* Summary & Progress */}
+                        <div className="space-y-6">
+                            <div className="bg-gray-50 dark:bg-white/5 p-6 rounded-2xl border dark:border-white/10">
+                                <div className="flex items-center justify-between mb-4">
+                                    <h4 className="font-bold text-gray-700 dark:text-white flex items-center gap-2">
+                                        <i className="fas fa-id-card text-blue-500"></i> Situation Financière
+                                    </h4>
+                                    <HelpGuide guideKey="accounting" size="sm" />
+                                </div>
+                                <div className="space-y-3">
+                                    <div className="flex justify-between text-sm">
+                                        <span className="text-gray-500 dark:text-gray-400">Matricule :</span>
+                                        <span className="font-bold font-mono text-blue-600 dark:text-blue-400">{currentStudent.matricule}</span>
+                                    </div>
+                                    <div className="flex justify-between items-center text-sm p-2 rounded-xl bg-amber-50/50 dark:bg-amber-900/10 border border-amber-200 dark:border-amber-800/30">
+                                        <span className="font-bold text-amber-800 dark:text-amber-300 flex items-center gap-1.5">
+                                            <i className="fas fa-star text-amber-500"></i> Statut Spécial :
+                                        </span>
+                                        <button
+                                            type="button"
+                                            onClick={() => {
+                                                const updated = { ...currentStudent, isSpecial: !currentStudent.isSpecial };
+                                                updateStudent(updated);
+                                            }}
+                                            className={`px-3 py-1 rounded-lg text-xs font-bold transition-all shadow-sm ${
+                                                currentStudent.isSpecial 
+                                                    ? 'bg-amber-500 text-white hover:bg-amber-600' 
+                                                    : 'bg-gray-200 text-gray-700 dark:bg-gray-700 dark:text-gray-300 hover:bg-gray-300'
+                                            }`}
+                                        >
+                                            {currentStudent.isSpecial ? 'Activé (Tarif Spécial)' : 'Désactivé (Tarif Standard)'}
+                                        </button>
+                                    </div>
+                                    <div className="flex justify-between text-sm">
+                                        <span className="text-gray-500 dark:text-gray-400">{currentStudent.isSpecial ? 'Mensualité Spéciale :' : 'Mensualité Normale :'}</span>
+                                        <span className={`font-bold ${currentStudent.isSpecial ? 'text-amber-600 dark:text-amber-400' : 'text-gray-800 dark:text-gray-200'}`}>
+                                            {currentStudentStats.monthlyFee.toLocaleString()} FCFA
+                                        </span>
+                                    </div>
+                                    <div className="flex justify-between text-sm">
+                                        <span className="text-gray-500 dark:text-gray-400">Total Annuel :</span>
+                                        <span className="font-bold dark:text-white">{currentStudentStats.annualFee.toLocaleString()} FCFA</span>
+                                    </div>
+                                    <div className="flex justify-between text-sm">
+                                        <span className="text-gray-500 dark:text-gray-400">Total Payé :</span>
+                                        <span className="font-bold text-green-600 dark:text-green-400">{currentStudentStats.paidAmount.toLocaleString()} FCFA</span>
+                                    </div>
+                                    <div className="flex justify-between text-sm pt-2 border-t dark:border-white/10">
+                                        <span className="font-bold text-gray-700 dark:text-white">Solde Restant :</span>
+                                        <span className="font-bold text-red-600 dark:text-red-400">{currentStudentStats.remainingAmount.toLocaleString()} FCFA</span>
+                                    </div>
+                                </div>
+
+                                {/* Radial Progress UI */}
+                                <div className="mt-6 flex flex-col items-center justify-center">
+                                    <div className="relative w-36 h-36">
+                                        <svg viewBox="0 0 36 36" className="w-full h-full transform -rotate-90">
+                                            {/* Track circle (Reste à recouvrer) */}
+                                            <circle 
+                                                cx="18" cy="18" r="15.915" 
+                                                fill="transparent" 
+                                                stroke="#fee2e2" 
+                                                strokeWidth="3.5" 
+                                                className="dark:stroke-red-950/50"
+                                            />
+                                            {/* Progress circle (Montant Payé) */}
+                                            <circle 
+                                                cx="18" cy="18" r="15.915" fill="transparent" 
+                                                stroke={currentStudentStats.progressPercent === 100 ? "#10b981" : "var(--primary-color, #3b82f6)"} 
+                                                strokeWidth="3.5" 
+                                                strokeDasharray={`${currentStudentStats.progressPercent} ${100 - currentStudentStats.progressPercent}`}
+                                                strokeDashoffset="0"
+                                                strokeLinecap="round"
+                                                className="transition-all duration-700 ease-out"
+                                            />
+                                        </svg>
+                                        <div className="absolute inset-0 flex flex-col items-center justify-center pointer-events-none">
+                                            <span className="text-2xl font-black text-gray-800 dark:text-white">
+                                                {currentStudentStats.progressPercent}%
+                                            </span>
+                                            <span className="text-[9px] uppercase font-bold text-gray-400 tracking-widest">
+                                                {currentStudentStats.progressPercent === 100 ? 'SOLDÉ' : 'Payé'}
+                                            </span>
+                                        </div>
+                                    </div>
+                                    <div className="mt-2 text-center text-xs">
+                                        {currentStudentStats.remainingAmount === 0 ? (
+                                            <span className="text-emerald-600 dark:text-emerald-400 font-bold">
+                                                <i className="fas fa-check-circle mr-1"></i> Frais de scolarité intégralement réglés
+                                            </span>
+                                        ) : (
+                                            <span className="text-gray-500 dark:text-gray-400">
+                                                Solde restant : <strong className="text-rose-600 dark:text-rose-400">{currentStudentStats.remainingAmount.toLocaleString()} FCFA</strong>
+                                            </span>
+                                        )}
+                                    </div>
+                                </div>
+
+                                {/* Échéancier et barres de progression mensuelle (sur 9 mois d'Octobre à Juin) */}
+                                <div className="mt-6 pt-5 border-t border-gray-200 dark:border-white/10 space-y-3">
+                                    <div className="flex items-center justify-between">
+                                        <h5 className="text-xs font-black uppercase tracking-wider text-gray-700 dark:text-gray-200 flex items-center gap-1.5">
+                                            <i className="fas fa-calendar-alt text-blue-500"></i> Progression Mensuelle (9 mois)
+                                        </h5>
+                                        <span className="text-[10px] text-gray-400 font-bold">
+                                            {currentStudentStats.monthlyFee > 0 ? `${currentStudentStats.monthlyFee.toLocaleString()} FCFA / mois` : 'Non défini'}
+                                        </span>
+                                    </div>
+
+                                    {currentStudentStats.monthlyFee <= 0 ? (
+                                        <p className="text-xs text-orange-500 italic py-2">Frais mensuels non configurés pour cette classe.</p>
+                                    ) : (
+                                        <div className="grid grid-cols-1 gap-2.5 max-h-56 overflow-y-auto pr-1 custom-scrollbar">
+                                            {[
+                                                { id: 1, label: 'Octobre' },
+                                                { id: 2, label: 'Novembre' },
+                                                { id: 3, label: 'Décembre' },
+                                                { id: 4, label: 'Janvier' },
+                                                { id: 5, label: 'Février' },
+                                                { id: 6, label: 'Mars' },
+                                                { id: 7, label: 'Avril' },
+                                                { id: 8, label: 'Mai' },
+                                                { id: 9, label: 'Juin' }
+                                            ].map((m, idx) => {
+                                                const monthlyFee = currentStudentStats.monthlyFee;
+                                                const totalPaid = currentStudentStats.paidAmount;
+                                                // Montant alloué à ce mois
+                                                const coveredBefore = idx * monthlyFee;
+                                                const paidForThisMonth = Math.max(0, Math.min(monthlyFee, totalPaid - coveredBefore));
+                                                const pct = monthlyFee > 0 ? Math.min(100, Math.round((paidForThisMonth / monthlyFee) * 100)) : 0;
+                                                const isCompleted = pct === 100;
+                                                const isPending = pct === 0;
+
+                                                return (
+                                                    <div key={m.id} className="p-2 bg-white dark:bg-white/5 rounded-xl border border-gray-100 dark:border-white/5 text-xs shadow-sm">
+                                                        <div className="flex items-center justify-between mb-1">
+                                                            <span className="font-bold text-gray-800 dark:text-gray-200 flex items-center gap-1.5">
+                                                                <span className={`w-2 h-2 rounded-full ${isCompleted ? 'bg-green-500' : pct > 0 ? 'bg-amber-500 animate-pulse' : 'bg-gray-300 dark:bg-gray-600'}`}></span>
+                                                                {m.label}
+                                                            </span>
+                                                            <div className="flex items-center gap-2">
+                                                                <span className="text-[10px] text-gray-500 dark:text-gray-400">
+                                                                    {paidForThisMonth.toLocaleString()} / {monthlyFee.toLocaleString()} FCFA
+                                                                </span>
+                                                                <span className={`font-black text-[10px] px-1.5 py-0.5 rounded ${
+                                                                    isCompleted ? 'bg-green-100 text-green-700 dark:bg-green-950/60 dark:text-green-300' :
+                                                                    pct > 0 ? 'bg-amber-100 text-amber-700 dark:bg-amber-950/60 dark:text-amber-300' :
+                                                                    'bg-gray-100 text-gray-500 dark:bg-white/10 dark:text-gray-400'
+                                                                }`}>
+                                                                    {pct}%
+                                                                </span>
+                                                            </div>
+                                                        </div>
+                                                        <div className="w-full bg-gray-100 dark:bg-gray-800 rounded-full h-2 overflow-hidden">
+                                                            <div 
+                                                                className={`h-full transition-all duration-700 ${
+                                                                    isCompleted 
+                                                                        ? 'bg-gradient-to-r from-emerald-500 to-green-600' 
+                                                                        : pct > 0 
+                                                                            ? 'bg-gradient-to-r from-amber-400 to-amber-600' 
+                                                                            : 'bg-transparent'
+                                                                }`} 
+                                                                style={{ width: `${pct}%` }}
+                                                            ></div>
+                                                        </div>
+                                                    </div>
+                                                );
+                                            })}
+                                        </div>
+                                    )}
+                                </div>
+                            </div>
+
+                            {/* Recent Payments for this student */}
+                            <div>
+                                <h4 className="font-bold text-gray-700 dark:text-white mb-3 text-sm">Historique Récent</h4>
+                                <div className="space-y-2 max-h-40 overflow-y-auto pr-2 custom-scrollbar">
+                                    {payments.filter(p => p.studentId === currentStudent.id).reverse().map(p => (
+                                        <div key={p.id} className="flex justify-between items-center p-3 bg-white dark:bg-white/5 border dark:border-white/10 rounded-xl text-xs transition-transform hover:scale-[1.02]">
+                                            <div className="flex-1">
+                                                <p className="font-bold dark:text-white">{p.amount.toLocaleString()} FCFA</p>
+                                                <p className="text-gray-500 dark:text-gray-400">{new Date(p.date).toLocaleDateString('fr-FR')} • <span className="capitalize">{p.method.replace('_', ' ')}</span></p>
+                                                {p.notes && <p className="text-[10px] italic mt-0.5 text-gray-400">{p.notes}</p>}
+                                            </div>
+                                            <button 
+                                                onClick={() => handleGenerateReceipt('ENCAISSEMENT', p, currentStudent)}
+                                                className="p-2 text-blue-600 hover:bg-blue-50 dark:hover:bg-blue-900/20 rounded-lg transition-colors flex items-center gap-1 font-semibold"
+                                                title="Générer un reçu PDF avec QR Code"
+                                            >
+                                                <i className="fas fa-file-pdf"></i> Reçu
+                                            </button>
+                                        </div>
+                                    ))}
+                                    {payments.filter(p => p.studentId === currentStudent.id).length === 0 && (
+                                        <p className="text-center text-gray-500 italic text-sm py-4">Aucun paiement enregistré.</p>
+                                    )}
+                                </div>
+                            </div>
+                        </div>
+
+                        {/* New Payment Form */}
+                        <div className="space-y-6">
+                            <div className="bg-blue-50 dark:bg-blue-900/10 p-6 rounded-2xl border border-blue-100 dark:border-blue-800/30">
+                                <h4 className="font-bold text-blue-700 dark:text-blue-300 mb-4 flex items-center gap-2">
+                                    <i className="fas fa-plus-circle"></i> Enregistrer un Versement
+                                </h4>
+                                {currentStudentStats.annualFee === 0 ? (
+                                    <div className="bg-orange-100 text-orange-800 p-4 rounded-xl text-sm border border-orange-200">
+                                        <i className="fas fa-exclamation-triangle mr-2"></i>
+                                        Les frais de scolarité pour la classe <strong>{currentStudent.serie ? `${currentStudent.classe} ${currentStudent.serie}` : currentStudent.classe}</strong> ne sont pas configurés. Veuillez vous rendre dans les <strong>Paramètres</strong> pour définir le montant mensuel de cette classe avant d'enregistrer un paiement.
+                                    </div>
+                                ) : (
+                                    <div className="space-y-4">
+                                        <Input 
+                                            label="Montant du versement (FCFA)" 
+                                            type="number" 
+                                            value={paymentAmount || ''} 
+                                            onChange={e => setPaymentAmount(parseInt(e.target.value) || 0)}
+                                            placeholder="Entrez le montant..."
+                                            className="text-lg font-bold"
+                                        />
+                                    <Select 
+                                        label="Mode de paiement"
+                                        value={paymentMethod}
+                                        onChange={e => setPaymentMethod(e.target.value as any)}
+                                        options={[
+                                            { value: 'cash', label: 'Espèces (Cash)' },
+                                            { value: 'wave', label: 'Wave' },
+                                            { value: 'mobile_money', label: 'Mobile Money' },
+                                            { value: 'check', label: 'Chèque' },
+                                            { value: 'card', label: 'Carte Bancaire' }
+                                        ]}
+                                    />
+                                    <Input 
+                                        label="Notes / Référence (Facultatif)" 
+                                        value={paymentNotes} 
+                                        onChange={e => setPaymentNotes(e.target.value)}
+                                        placeholder="Ex: Frais de Novembre..."
+                                    />
+                                    
+                                    <div className="pt-2">
+                                        <Button 
+                                            variant="success" 
+                                            className="w-full h-12 text-lg shadow-lg shadow-green-500/20"
+                                            onClick={handleRecordPayment}
+                                            disabled={paymentAmount <= 0}
+                                        >
+                                            Valider le Paiement
+                                        </Button>
+                                    </div>
+                                </div>
+                                )}
+                            </div>
+                            
+                            <p className="text-[10px] text-gray-500 dark:text-gray-400 text-center italic">
+                                Note : Un versement peut être une avance mensuelle ou un paiement groupé, du moment qu'il ne dépasse pas le solde annuel de l'élève.
+                            </p>
+                        </div>
+                    </div>
+                </Modal>
+            )}
+        {/* Other Payment Modal (Encaissement Divers) */}
+        {isOtherPaymentModalOpen && (
+            <Modal
+                isOpen={true}
+                onClose={() => setIsOtherPaymentModalOpen(false)}
+                title="Enregistrer un Encaissement Divers"
+                maxWidth="max-w-lg"
+            >
+                <div className="p-6 bg-emerald-50 dark:bg-emerald-900/10 rounded-2xl border border-emerald-100 dark:border-emerald-800/30">
+                    <div className="flex items-center gap-3 mb-6 border-b border-emerald-200/50 pb-4">
+                        <div className="w-10 h-10 rounded-full bg-emerald-100 dark:bg-emerald-800/50 flex items-center justify-center text-emerald-600 dark:text-emerald-400">
+                            <i className="fas fa-coins text-xl"></i>
+                        </div>
+                        <div>
+                            <h4 className="font-bold text-emerald-800 dark:text-emerald-300 text-lg">Nouvel Encaissement</h4>
+                            <p className="text-xs text-emerald-600 dark:text-emerald-500">Paiement non lié à la scolarité d'un élève</p>
+                        </div>
+                    </div>
+
+                    <div className="space-y-5">
+                        <Input
+                            label="Montant de l'encaissement (FCFA) *"
+                            type="number"
+                            value={otherPaymentAmount || ''}
+                            onChange={e => setOtherPaymentAmount(parseInt(e.target.value) || 0)}
+                            placeholder="Ex: 5000"
+                            className="text-xl font-bold text-emerald-700"
+                        />
+                        <Select
+                            label="Mode de paiement *"
+                            value={otherPaymentMethod}
+                            onChange={e => setOtherPaymentMethod(e.target.value as any)}
+                            options={[
+                                { value: 'cash', label: 'Espèces (Cash)' },
+                                { value: 'wave', label: 'Wave' },
+                                { value: 'mobile_money', label: 'Mobile Money' },
+                                { value: 'check', label: 'Chèque' },
+                                { value: 'card', label: 'Carte Bancaire' }
+                            ]}
+                        />
+                        <Input
+                            label="Motif / Référence *"
+                            value={otherPaymentNotes}
+                            onChange={e => setOtherPaymentNotes(e.target.value)}
+                            placeholder="Ex: Vente de t-shirts, Don, etc..."
+                        />
+                        <div className="pt-4">
+                            <Button
+                                variant="primary"
+                                className="w-full h-12 text-lg shadow-lg shadow-emerald-500/30 !bg-emerald-600 hover:!bg-emerald-700"
+                                onClick={handleRecordOtherEncashment}
+                                disabled={otherPaymentAmount <= 0 || !otherPaymentNotes.trim()}
+                            >
+                                <i className="fas fa-check-circle mr-2"></i> Valider l'encaissement
+                            </Button>
+                        </div>
+                    </div>
+                </div>
+            </Modal>
+        )}
+        </div>
+    );
+};

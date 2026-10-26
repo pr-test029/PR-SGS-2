@@ -1,0 +1,6 @@
+{
+  "name": "PR-SGS",
+  "description": "Système de Gestion Scolaire complet avec génération de bulletins et assistant IA.",
+  "requestFramePermissions": [],
+  "capabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
