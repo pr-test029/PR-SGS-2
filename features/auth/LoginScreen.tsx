@@ -3,7 +3,7 @@ import React, { useState, useEffect } from 'react';
 import { Card, Button, Input, Modal } from '../../components/ui/Common';
 import { UserSession, UserRole } from '../../types';
 import * as api from '../../services/firebase';
-import { getSchoolManagerPassword } from '../../services/firebase';
+import { getSchoolManagerPassword, checkSchoolHasManagerSecurity } from '../../services/firebase';
 import { SubscriptionPayment } from '../subscription/SubscriptionPayment';
 import { OfflineCodeVerificationForm } from '../../components/OfflineCodeVerificationForm';
 import { syncSchoolCredentialsOffline } from '../../services/offlineAuthService';
@@ -39,6 +39,7 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({ onLoginSuccess }) => {
     const [expiredSchoolId, setExpiredSchoolId] = useState<string>('');
     const [showPaymentForm, setShowPaymentForm] = useState(false);
     const [schoolLogo, setSchoolLogo] = useState<string>('');
+    const [isUserAdmin, setIsUserAdmin] = useState(false);
 
     // Récupérer la session école existante au chargement
     useEffect(() => {
@@ -92,6 +93,28 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({ onLoginSuccess }) => {
             }).catch(() => {});
         }
     }, [schoolInfo?.id]);
+
+    // Détection dynamique et sécurisée du statut administrateur
+    useEffect(() => {
+        let isMounted = true;
+        const verifyAdminStatus = async () => {
+            const admin = await api.checkCurrentUserIsAdmin();
+            if (isMounted) {
+                setIsUserAdmin(admin);
+            }
+        };
+
+        verifyAdminStatus();
+
+        const unsub = api.auth.onAuthStateChanged(() => {
+            verifyAdminStatus();
+        });
+
+        return () => {
+            isMounted = false;
+            unsub();
+        };
+    }, [step, schoolInfo?.id]);
 
     // Phase 1: School Connection
     const handleSchoolAuth = async (e: React.FormEvent) => {
@@ -147,10 +170,35 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({ onLoginSuccess }) => {
         }
 
         if (selectedRole === 'dirigeant') {
-            // Un dirigeant peut être soit l'administrateur principal de l'école (mot de passe école),
-            // soit un membre du personnel créé avec le rôle "dirigeant" (avec son code/matricule unique).
-            setManagerPasswordInput('');
-            setStep('manager_password');
+            // Vérifier si un mot de passe ou un dirigeant spécifique existe pour cette école
+            if (schoolInfo?.id) {
+                setLoading(true);
+                try {
+                    const sec = await checkSchoolHasManagerSecurity(schoolInfo.id);
+                    if (sec.hasSecurity) {
+                        // Il y a un mot de passe configuré ou au moins un dirigeant dans le personnel
+                        setManagerPasswordInput('');
+                        setStep('manager_password');
+                    } else {
+                        // École nouvellement créée ou sans aucun code / dirigeant configuré : accès direct !
+                        await finishLogin('dirigeant');
+                    }
+                } catch {
+                    // En cas d'erreur de lecture, autoriser l'accès direct
+                    await finishLogin('dirigeant');
+                } finally {
+                    setLoading(false);
+                }
+            } else {
+                await finishLogin('dirigeant');
+            }
+        } else if (selectedRole === 'admin') {
+            const admin = await api.checkCurrentUserIsAdmin();
+            if (!admin) {
+                setError("Accès non autorisé : ce compte ne possède pas les droits administrateur.");
+                return;
+            }
+            await finishLogin('admin');
         } else {
             setStep('identity_verification');
         }
@@ -248,9 +296,12 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({ onLoginSuccess }) => {
                         await api.updateUserRole(currentUser.uid, 'dirigeant', currentUser.isAnonymous);
                     }
                     session.role = 'dirigeant';
-                } else if (finalRole === 'admin' && session.role !== 'admin') {
-                    setError("Vous n'avez pas les droits d'administration.");
-                    return;
+                } else if (finalRole === 'admin') {
+                    const isSystemAdmin = session.role === 'admin' || session.email === 'powerfulreach029@gmail.com';
+                    if (!isSystemAdmin) {
+                        setError("Ce compte ne possède pas le rôle d'administrateur.");
+                        return;
+                    }
                 }
 
                 onLoginSuccess({
@@ -477,7 +528,10 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({ onLoginSuccess }) => {
                         <p className="text-gray-500 mt-2">Sélectionnez votre rôle pour continuer</p>
                     </div>
 
-                    <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-5 gap-6">
+                    <div className={`grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 ${isUserAdmin ? 'xl:grid-cols-6' : 'xl:grid-cols-5'} gap-6`}>
+                        {isUserAdmin && (
+                            <RoleCard icon="shield-alt" title="Admin" desc="Administration globale" onClick={() => handleRoleSelect('admin')} />
+                        )}
                         <RoleCard icon="user-tie" title="Dirigeant" desc="Gestion totale" onClick={() => handleRoleSelect('dirigeant')} />
                         <RoleCard icon="building-columns" title="Directeur" desc="Gestion par cycle" onClick={() => handleRoleSelect('directeur')} />
                         <RoleCard icon="user-cog" title="Gestionnaire" desc="Inscriptions" onClick={() => handleRoleSelect('gestionnaire')} />
